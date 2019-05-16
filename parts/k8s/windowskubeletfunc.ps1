@@ -41,7 +41,9 @@ Write-AzureConfig {
         [Parameter(Mandatory = $true)][string]
         $KubeDir,
         [Parameter(Mandatory = $true)][string]
-        $TargetEnvironment
+        $TargetEnvironment,
+        [Parameter(Mandatory = $false)][bool]
+        $UseContainerD = $false
     )
 
     if ( -Not $PrimaryAvailabilitySetName -And -Not $PrimaryScaleSetName ) {
@@ -134,16 +136,49 @@ users:
 }
 
 function
+Test-ContainerImageExists {
+    Param(
+        [Parameter(Mandatory = $true)][string]
+        $Image,
+        [Parameter(Mandatory = $false)][string]
+        $Tag,
+        [Parameter(Mandatory = $false)][string]
+        $ContainerRuntime = "docker"
+    )
+
+    $target = $Image
+    if ($Tag) {
+        $target += ":$Tag"
+    }
+
+    if ($ContainerRuntime -eq "docker") {
+        $images = docker image list $target --format "{{json .}}"
+        return $images.Count -gt 0
+    }
+    else
+    {
+        return ( (ctr.exe -n k8s.io images list) | Select-String $target) -ne $Null
+    }
+}
+
+function
 Build-PauseContainer {
     Param(
         [Parameter(Mandatory = $true)][string]
         $WindowsBase,
-        $DestinationTag
+        $DestinationTag,
+        $ContainerRuntime = "docker"
     )
     # Future work: This needs to build wincat - see https://github.com/Azure/aks-engine/issues/1461
+    # Otherwise, delete this code and require a prebuilt pause image (or override with one from an Azure Container Registry instance)
+    # ContainerD can't build, so doing the builds outside of node deployment is probably the right long-term solution.
     "FROM $($WindowsBase)" | Out-File -encoding ascii -FilePath Dockerfile
     "CMD cmd /c ping -t localhost" | Out-File -encoding ascii -FilePath Dockerfile -Append
-    Invoke-Executable -Executable "docker" -ArgList @("build", "-t", "$DestinationTag", ".")
+    if ($ContainerRuntime -eq "docker") {
+        Invoke-Executable -Executable "docker" -ArgList @("build", "-t", "$DestinationTag", ".")
+    } else {
+        throw "Cannot build pause container without Docker"
+    }
 }
 
 function
@@ -151,7 +186,8 @@ New-InfraContainer {
     Param(
         [Parameter(Mandatory = $true)][string]
         $KubeDir,
-        $DestinationTag = "kubletwin/pause"
+        $DestinationTag = "kubletwin/pause",
+        $ContainerRuntime = "docker"
     )
     cd $KubeDir
     $computerInfo = Get-ComputerInfo
@@ -160,46 +196,29 @@ New-InfraContainer {
     # Then docker run --rm mplatform/manifest-tool inspect mcr.microsoft.com/k8s/core/pause:<tag>
 
     $defaultPauseImage = "mcr.microsoft.com/k8s/core/pause:1.2.0"
-
     switch ($computerInfo.WindowsVersion) {
-        "1803" {
-            $imageList = docker images $defaultPauseImage --format "{{.Repository}}:{{.Tag}}"
-            if (-not $imageList) {
-                Invoke-Executable -Executable "docker" -ArgList @("pull", "$defaultPauseImage") -Retries 5 -RetryDelaySeconds 30
+        {$_ -eq "1803" -or $_ -eq "1809"}  {
+            if ($ContainerRuntime -eq "docker") {
+                if (-not (Test-ContainerImageExists -Image $defaultPauseImage -ContainerRuntime $ContainerRuntime)) {
+                    Invoke-Executable -Executable "docker" -ArgList @("pull", "$defaultPauseImage") -Retries 5 -RetryDelaySeconds 30
+                }
+                Invoke-Executable -Executable "docker" -ArgList @("tag", "$defaultPauseImage", "$DestinationTag")
+            } else {
+                # containerd
+                if (-not (Test-ContainerImageExists -Image $defaultPauseImage -ContainerRuntime $ContainerRuntime)) {
+                    Invoke-Executable -Executable "ctr" -ArgList @("-n", "k8s.io", "image", "pull", "$defaultPauseImage") -Retries 5 -RetryDelaySeconds 30
+                }
+                Invoke-Executable -Executable "ctr" -ArgList @("-n", "k8s.io", "image", "tag", "$defaultPauseImage", "$DestinationTag")
             }
-            Invoke-Executable -Executable "docker" -ArgList @("tag", "$defaultPauseImage", "$DestinationTag")
         }
-        "1809" {
-            $imageList = docker images $defaultPauseImage --format "{{.Repository}}:{{.Tag}}"
-            if (-not $imageList) {
-                Invoke-Executable -Executable "docker" -ArgList @("pull", "$defaultPauseImage") -Retries 5 -RetryDelaySeconds 30
-            }
-            Invoke-Executable -Executable "docker" -ArgList @("tag", "$defaultPauseImage", "$DestinationTag")
+        "1903" { 
+            Build-PauseContainer -WindowsBase "mcr.microsoft.com/windows/nanoserver:1903" -DestinationTag $DestinationTag -ContainerRuntime $ContainerRuntime
         }
-        "1903" { Build-PauseContainer -WindowsBase "mcr.microsoft.com/windows/nanoserver:1903" -DestinationTag $DestinationTag}
-        default { Build-PauseContainer -WindowsBase "mcr.microsoft.com/nanoserver-insider" -DestinationTag $DestinationTag}
+        default { 
+            Build-PauseContainer -WindowsBase "mcr.microsoft.com/nanoserver-insider" -DestinationTag $DestinationTag -ContainerRuntime $ContainerRuntime
+        }
     }
 }
-
-function
-Test-ContainerImageExists {
-    Param(
-        [Parameter(Mandatory = $true)][string]
-        $Image,
-        [Parameter(Mandatory = $false)][string]
-        $Tag
-    )
-
-    $target = $Image
-    if ($Tag) {
-        $target += ":$Tag"
-    }
-
-    $images = docker image list $target --format "{{json .}}"
-
-    return $images.Count -gt 0
-}
-
 
 # TODO: Deprecate this and replace with methods that get individual components instead of zip containing everything
 # This expects the ZIP file created by Azure Pipelines.
@@ -349,7 +368,9 @@ Install-KubernetesServices {
         [Parameter(Mandatory = $true)][string]
         $HNSModule,
         [Parameter(Mandatory = $true)][string]
-        $KubeletNodeLabels
+        $KubeletNodeLabels,
+        [Parameter(Mandatory = $false)][bool]
+        $UseContainerD = $false
     )
 
     # Calculate some local paths
@@ -385,6 +406,11 @@ Install-KubernetesServices {
     }
     else {
         throw "Unknown network type $NetworkPlugin, can't configure kubelet"
+    }
+
+    # Update args to use ContainerD if needed
+    if ($UseContainerD -eq $true) {
+        $KubeletArgList += @("--container-runtime=remote", "--container-runtime-endpoint=npipe://./pipe/containerd-containerd")
     }
 
     # Used in WinCNI version of kubeletstart.ps1
@@ -478,7 +504,8 @@ $KubeletCommandLine
 
 "@
     }
-    else {
+    elseif (($NetworkPlugin -eq "kubenet" ) -and ($UseContainerD -eq $false))
+    {
         # using WinCNI. TODO: If WinCNI support is removed, then delete this as dead code later
         $KubeNetwork = "l2bridge"
         $kubeStartStr += @"
@@ -611,7 +638,153 @@ catch
 }
 
 "@
-    } # end else using WinCNI.
+    } # end elseif using WinCNI and Docker.
+    elseif (($NetworkPlugin -eq "kubenet" ) -and ($UseContainerD -eq $true))
+    {
+        # using SDNBridge & Containerd
+        $KubeNetwork = "l2bridge"
+        $kubeStartStr += @"
+
+function
+Get-DefaultGateway(`$CIDR)
+{
+    return `$CIDR.substring(0,`$CIDR.lastIndexOf(".")) + ".1"
+}
+
+function
+Get-PodCIDR()
+{
+    `$podCIDR = c:\k\kubectl.exe --kubeconfig=c:\k\config get nodes/`$(`$env:computername.ToLower()) -o custom-columns=podCidr:.spec.podCIDR --no-headers
+    return `$podCIDR
+}
+
+function
+Test-PodCIDR(`$podCIDR)
+{
+    return `$podCIDR.length -gt 0
+}
+
+function
+Update-CNIConfig(`$podCIDR, `$masterSubnetGW)
+{
+    `$jsonSampleConfig =
+"{
+    ""cniVersion"": ""0.2.0"",
+    ""name"": ""<NetworkMode>"",
+    ""type"": ""sdnbridge.exe"",
+    ""master"": ""Ethernet"",
+    ""capabilities"": { ""portMappings"": true },
+    ""ipam"": {
+        ""environment"": ""azure"",
+        ""subnet"":""<PODCIDR>"",
+        ""routes"": [{
+        ""GW"":""<PODGW>""
+        }]
+    },
+    ""dns"" : {
+    ""Nameservers"" : [ ""<NameServers>"" ],
+    ""Search"" : [ ""<Cluster DNS Suffix or Search Path>"" ]
+    },
+    ""AdditionalArgs"" : [
+    {
+        ""Name"" : ""EndpointPolicy"", ""Value"" : { ""Type"" : ""OutBoundNAT"", ""ExceptionList"": [ ""<ClusterCIDR>"", ""<MgmtSubnet>"" ] }
+    },
+    {
+        ""Name"" : ""EndpointPolicy"", ""Value"" : { ""Type"" : ""ROUTE"", ""DestinationPrefix"": ""<ServiceCIDR>"", ""NeedEncap"" : true }
+    }
+    ]
+}"
+
+    `$configJson = ConvertFrom-Json `$jsonSampleConfig
+    `$configJson.name = `$global:NetworkMode.ToLower()
+    `$configJson.ipam.subnet=`$podCIDR
+    `$configJson.ipam.routes[0].GW = `$masterSubnetGW
+    `$configJson.dns.Nameservers[0] = `$global:KubeDnsServiceIp
+    `$configJson.dns.Search[0] = `$global:KubeDnsSearchPath
+
+    `$configJson.AdditionalArgs[0].Value.ExceptionList[0] = `$global:KubeClusterCIDR
+    `$configJson.AdditionalArgs[0].Value.ExceptionList[1] = `$global:MasterSubnet
+    `$configJson.AdditionalArgs[1].Value.DestinationPrefix  = `$global:KubeServiceCIDR
+
+    if (Test-Path `$global:CNIConfig)
+    {
+        Clear-Content -Path `$global:CNIConfig
+    }
+
+    Write-Host "Generated CNI Config [`$configJson]"
+
+    Add-Content -Path `$global:CNIConfig -Value (ConvertTo-Json `$configJson -Depth 20)
+}
+
+try
+{
+    `$masterSubnetGW = Get-DefaultGateway `$global:MasterSubnet
+    `$podCIDR=Get-PodCIDR
+    `$podCidrDiscovered=Test-PodCIDR(`$podCIDR)
+
+    # if the podCIDR has not yet been assigned to this node, start the kubelet process to get the podCIDR, and then promptly kill it.
+    if (-not `$podCidrDiscovered)
+    {
+        `$argList = $KubeletArgListStr
+
+        `$process = Start-Process -FilePath c:\k\kubelet.exe -PassThru -ArgumentList `$argList
+
+        # run kubelet until podCidr is discovered
+        Write-Host "waiting to discover pod CIDR"
+        while (-not `$podCidrDiscovered)
+        {
+            Write-Host "Sleeping for 10s, and then waiting to discover pod CIDR"
+            Start-Sleep 10
+
+            `$podCIDR=Get-PodCIDR
+            `$podCidrDiscovered=Test-PodCIDR(`$podCIDR)
+        }
+
+        # stop the kubelet process now that we have our CIDR, discard the process output
+        `$process | Stop-Process | Out-Null
+    }
+
+    # Turn off Firewall to enable pods to talk to service endpoints. (Kubelet should eventually do this)
+    netsh advfirewall set allprofiles state off
+
+    # startup the service
+    `$hnsNetwork = Get-HnsNetwork | ? Name -EQ `$global:NetworkMode.ToLower()
+
+    if (`$hnsNetwork)
+    {
+        # Kubelet has been restarted with existing network.
+        # Cleanup all containers
+        docker ps -q | foreach {docker rm `$_ -f}
+        # cleanup network
+        Write-Host "Cleaning up old HNS network found"
+        Remove-HnsNetwork `$hnsNetwork
+        Start-Sleep 10
+    }
+
+    Write-Host "Creating a new hns Network"
+    ipmo `$global:HNSModule
+
+    `$hnsNetwork = New-HNSNetwork -Type `$global:NetworkMode -AddressPrefix `$podCIDR -Gateway `$masterSubnetGW -Name `$global:NetworkMode.ToLower() -Verbose
+    # New network has been created, Kubeproxy service has to be restarted
+    Restart-Service Kubeproxy
+
+    Start-Sleep 10
+    # Add route to all other POD networks
+    Update-CNIConfig `$podCIDR `$masterSubnetGW
+
+    $KubeletCommandLine
+}
+catch
+{
+    Write-Error `$_
+}
+
+"@
+    } # end elseif using sdnbridge and containerd.
+    else
+    {
+        Write-Error "The combination of $NetworkPlugin and UseContainerD=$UseContainerD is not implemented"
+    }
 
     # Now that the script is generated, based on what CNI plugin and startup options are needed, write it to disk
     $kubeStartStr | Out-File -encoding ASCII -filepath $KubeletStartFile
