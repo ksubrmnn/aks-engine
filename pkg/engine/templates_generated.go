@@ -39678,6 +39678,7 @@ try
         elseif ($global:NetworkPlugin -eq "kubenet") {
             Write-Log "Fetching additional files needed for kubenet"
             if ($useContainerD) {
+                # TODO: CNI may need to move to c:\program files\containerd\cni\bin with ContainerD
                 Install-SdnBridge -Url $global:ContainerdSdnPluginUrl -CNIPath $global:CNIPath
             } else {
                 Update-WinCNI -CNIPath $global:CNIPath
@@ -41553,6 +41554,11 @@ catch
     } # end elseif using WinCNI and Docker.
     elseif (($NetworkPlugin -eq "kubenet" ) -and ($UseContainerD -eq $true))
     {
+        # TODO: something is wrong with the CNI configuration
+        # Warning  FailedCreatePodSandBox  2m16s (x222 over 50m)  kubelet, 4068k8s011  (combined from similar events): Failed to create pod sandbox: 
+        # rpc error: code = Unknown desc = failed to setup network for sandbox "922b1a200078edb15c7a5732612cbe19e5dadf7cf8a4622d72b376874522435d": error creating endpoint hcnCreateEndpoint failed in Win32: Invalid JSON document string. (0x803b001b) {"Success":false,"Error":"Invalid JSON document string. {{Policies.Type,UnknownEnumValue}}","ErrorCode":2151350299} : endpoint config &{ 922b1a200078edb15c7a5732612cbe19e5dadf7cf8a4622d72b376874522435d_l2bridge f94e9649-d4df-486e-bcd4-2721938d89f3  [{OutBoundNAT []} {ROUTE []}] [] { [default.svc.cluster.local] [10.0.0.10] []} [{10.240.0.1 0.0.0.0/0 0}]  0 {2 0}}
+
+
         # using SDNBridge & Containerd
         $KubeNetwork = "l2bridge"
         $kubeStartStr += @"

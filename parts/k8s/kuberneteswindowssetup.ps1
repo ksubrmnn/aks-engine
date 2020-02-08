@@ -346,6 +346,7 @@ try
         elseif ($global:NetworkPlugin -eq "kubenet") {
             Write-Log "Fetching additional files needed for kubenet"
             if ($useContainerD) {
+                # TODO: CNI may need to move to c:\program files\containerd\cni\bin with ContainerD
                 Install-SdnBridge -Url $global:ContainerdSdnPluginUrl -CNIPath $global:CNIPath
             } else {
                 Update-WinCNI -CNIPath $global:CNIPath
